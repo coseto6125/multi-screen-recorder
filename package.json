@@ -1,0 +1,21 @@
+{
+  "name": "multi-screen-recorder",
+  "version": "1.0.0",
+  "description": "Multi Screen Recorder - record multiple screens into one video, convert to MP4, upload to YouTube",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "keywords": [
+    "tauri",
+    "screen-recorder",
+    "multi-screen",
+    "youtube"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
