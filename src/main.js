@@ -53,7 +53,8 @@
   let selectedCodec = 'vp8';
   let selectedBitrate = 3000000;
   let maxRes = { w: 1920, h: 1080 };
-  let phase = 'idle'; // idle | starting | recording | finalizing
+  // The webview owns take phase transitions; the backend owns the open file.
+let phase = 'idle'; // idle | starting | recording | finalizing
   let mediaRecorder = null;
   let recordStream = null;
   let take = null; // per-recording sink (src/take.js); see startRecording

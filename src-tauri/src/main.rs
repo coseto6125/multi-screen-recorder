@@ -17,8 +17,8 @@ use tauri_plugin_opener::OpenerExt;
 
 struct AppState {
     recordings_dir: Mutex<PathBuf>,
-    /// Open recording file, present only between start_recording and finish/abort
-    sink: Mutex<Option<RecordingSink>>,
+    /// One take's slot: the backend side of the recording-open fact
+    take: Mutex<TakeSlot>,
 }
 
 /// A recording file kept open for the whole session so MediaRecorder chunks can be
@@ -157,6 +157,82 @@ impl RecordingSink {
     }
 }
 
+/// One take's slot on the backend side. The webview owns the phase transitions;
+/// this slot owns whether a backend file is open, and what a close request means
+/// while a start is still in flight. Every pairing rule between commands lives
+/// here so the commands stay thin adapters over it.
+struct TakeSlot {
+    sink: Option<RecordingSink>,
+    /// True between the start of start_recording and register(): no file is
+    /// open yet, but one is about to be.
+    starting: bool,
+    /// A close was requested during that window; register() must salvage the
+    /// fresh file instead of opening a take nobody will ever write to.
+    close_pending: bool,
+}
+
+enum AbortDecision {
+    /// A file is open: salvage it.
+    Salvage(RecordingSink),
+    /// A start is in flight and no file exists yet: remember the close request.
+    PendingStart,
+    /// Idle: nothing to do, and the next take must not be poisoned.
+    Nothing,
+}
+
+impl TakeSlot {
+    fn new() -> Self {
+        Self { sink: None, starting: false, close_pending: false }
+    }
+
+    /// Begins a start. Refused while another file is open or another start is
+    /// already in flight.
+    fn begin(&mut self) -> Result<(), String> {
+        if self.sink.is_some() || self.starting {
+            return Err("The previous recording is still being finalized".into());
+        }
+        self.starting = true;
+        Ok(())
+    }
+
+    /// The file could not be created: reset the slot so a later take starts clean.
+    fn cancel(&mut self) {
+        self.starting = false;
+        self.close_pending = false;
+    }
+
+    /// Registers a freshly created sink. Err(sink) means a close was requested
+    /// while this start was in flight: salvage it immediately, never store it.
+    fn register(&mut self, sink: RecordingSink) -> Result<(), RecordingSink> {
+        self.starting = false;
+        if self.close_pending {
+            self.close_pending = false;
+            return Err(sink);
+        }
+        self.sink = Some(sink);
+        Ok(())
+    }
+
+    fn abort(&mut self) -> AbortDecision {
+        if let Some(sink) = self.sink.take() {
+            AbortDecision::Salvage(sink)
+        } else if self.starting {
+            self.close_pending = true;
+            AbortDecision::PendingStart
+        } else {
+            AbortDecision::Nothing
+        }
+    }
+
+    fn current(&mut self) -> Result<&mut RecordingSink, String> {
+        self.sink.as_mut().ok_or_else(|| "No recording is in progress".to_string())
+    }
+
+    fn finish(&mut self) -> Result<RecordingSink, String> {
+        self.sink.take().ok_or_else(|| "No recording is in progress".to_string())
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Settings {
     #[serde(rename = "recordingsDir")]
@@ -273,16 +349,24 @@ fn start_recording(state: State<'_, AppState>) -> Result<String, String> {
     let dir = state.recordings_dir.lock().unwrap().clone();
     ensure_dir(&dir)?;
 
-    // Held across the create so two takes can never share a sink
-    let mut guard = state.sink.lock().unwrap();
-    if guard.is_some() {
-        return Err("The previous recording is still being finalized".into());
-    }
+    // Held across the create so two takes can never share a slot
+    let mut guard = state.take.lock().unwrap();
+    guard.begin()?;
     let stamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
-    let sink = RecordingSink::create(&dir, &format!("recording-{stamp}"))
-        .map_err(|e| format!("Cannot create recording file: {e}"))?;
+    let sink = match RecordingSink::create(&dir, &format!("recording-{stamp}")) {
+        Ok(sink) => sink,
+        Err(e) => {
+            guard.cancel();
+            return Err(format!("Cannot create recording file: {e}"));
+        }
+    };
     let path = sink.final_path.to_string_lossy().to_string();
-    *guard = Some(sink);
+    if let Err(sink) = guard.register(sink) {
+        // A close was requested while this start was in flight: salvage the
+        // fresh file now so no orphan part is left behind
+        sink.salvage();
+        return Err("Recording was closed before it could start".into());
+    }
     Ok(path)
 }
 
@@ -296,11 +380,12 @@ fn append_recording_chunk(
     let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
         return Err("Invalid recording data (expected raw bytes)".into());
     };
-    let mut guard = state.sink.lock().unwrap();
-    let sink = guard
-        .as_mut()
-        .ok_or_else(|| "No recording is in progress".to_string())?;
-    sink.append(data)
+    state
+        .take
+        .lock()
+        .unwrap()
+        .current()?
+        .append(data)
         .map_err(|e| format!("Cannot write recording: {e}"))
 }
 
@@ -310,10 +395,9 @@ fn append_recording_chunk(
 async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String> {
     let sink = {
         let state: State<'_, AppState> = app.state();
-        let sink = state.sink.lock().unwrap().take();
-        sink
+        let mut slot = state.take.lock().unwrap();
+        slot.finish()?
     };
-    let sink = sink.ok_or_else(|| "No recording is in progress".to_string())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let (path, bytes) = sink.commit()?;
@@ -334,12 +418,14 @@ async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String>
 // disk under a `.partial.webm` name, so a failure costs the tail, not the whole session.
 #[tauri::command(async)]
 fn abort_recording(state: State<'_, AppState>) -> Option<String> {
-    let sink = state.sink.lock().unwrap().take()?;
-    let (path, bytes) = sink.salvage();
-    if bytes == 0 {
-        return None;
+    match state.take.lock().unwrap().abort() {
+        AbortDecision::Salvage(sink) => {
+            let (path, bytes) = sink.salvage();
+            (bytes > 0).then(|| path.to_string_lossy().to_string())
+        }
+        // A start still in flight salvages its own fresh file on register()
+        _ => None,
     }
-    Some(path.to_string_lossy().to_string())
 }
 
 // Convert WebM to MP4; emits convert-progress {fileName, percent}; deletes source on success
@@ -435,7 +521,7 @@ fn main() {
             let _ = ensure_dir(&dir);
             app.manage(AppState {
                 recordings_dir: Mutex::new(dir),
-                sink: Mutex::new(None),
+                take: Mutex::new(TakeSlot::new()),
             });
             Ok(())
         })
@@ -456,7 +542,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::RecordingSink;
+    use super::{AbortDecision, RecordingSink, TakeSlot};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -595,5 +681,116 @@ mod tests {
         let parent = temp_dir("missing");
         assert!(RecordingSink::create(&parent.join("not-created"), "rec").is_err());
         fs::remove_dir_all(&parent).unwrap();
+    }
+
+    fn open_sink(dir: &std::path::Path) -> RecordingSink {
+        RecordingSink::create(dir, "rec").unwrap()
+    }
+
+    #[test]
+    fn test_abort_with_open_sink_salvages_the_file() {
+        let dir = temp_dir("slot-abort-open");
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        assert!(slot.register(open_sink(&dir)).is_ok());
+        slot.current().unwrap().append(b"keep").unwrap();
+
+        match slot.abort() {
+            AbortDecision::Salvage(sink) => {
+                let (partial, bytes) = sink.salvage();
+                assert_eq!(bytes, 4);
+                assert!(partial.to_string_lossy().contains("rec.partial.webm"));
+            }
+            _ => panic!("open sink must salvage"),
+        }
+        assert!(slot.finish().is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_close_during_start_salvages_the_fresh_file_on_register() {
+        let dir = temp_dir("slot-close-during-start");
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        // The close request arrives while the start is still in flight
+        assert!(matches!(slot.abort(), AbortDecision::PendingStart));
+
+        let sink = open_sink(&dir);
+        let part = sink.part_path.clone();
+        assert!(part.exists());
+        let Err(sink) = slot.register(sink) else {
+            panic!("a pending close must reject the fresh sink");
+        };
+        // Salvaging the zero-byte fresh file removes it: no orphan part is left
+        let (gone, bytes) = sink.salvage();
+        assert_eq!(bytes, 0);
+        assert!(!gone.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_abort_when_idle_does_not_poison_the_next_take() {
+        let dir = temp_dir("slot-abort-idle");
+        let mut slot = TakeSlot::new();
+        assert!(matches!(slot.abort(), AbortDecision::Nothing));
+
+        slot.begin().unwrap();
+        assert!(slot.register(open_sink(&dir)).is_ok());
+        assert!(slot.finish().is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_pending_close_is_consumed_by_register() {
+        let dir = temp_dir("slot-pending-once");
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        assert!(matches!(slot.abort(), AbortDecision::PendingStart));
+        assert!(slot.register(open_sink(&dir)).is_err());
+
+        // The pending close applied to that start only
+        slot.begin().unwrap();
+        assert!(slot.register(open_sink(&dir)).is_ok());
+        drop(slot.finish().unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_second_begin_while_open_or_starting_is_refused() {
+        let dir = temp_dir("slot-double-begin");
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        assert!(slot.register(open_sink(&dir)).is_ok());
+        assert!(slot.begin().is_err());
+        drop(slot.finish().unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+
+        let mut slot2 = TakeSlot::new();
+        slot2.begin().unwrap();
+        assert!(slot2.begin().is_err());
+        slot2.cancel();
+        assert!(slot2.begin().is_ok());
+    }
+
+    #[test]
+    fn test_cancel_after_failed_create_resets_the_slot() {
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        slot.cancel();
+        // A close request must not survive into the next take either
+        slot.begin().unwrap();
+        slot.cancel();
+        let dir = temp_dir("slot-cancel-clean");
+        slot.begin().unwrap();
+        assert!(slot.register(open_sink(&dir)).is_ok());
+        drop(slot.finish().unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_append_and_finish_without_a_sink_error() {
+        let mut slot = TakeSlot::new();
+        assert!(slot.current().is_err());
+        assert!(slot.finish().is_err());
     }
 }
