@@ -10,9 +10,6 @@
   const appWindow = window.__TAURI__.window.getCurrentWindow();
 
   const MAX_SCREENS = 4;
-  // Stop the take rather than let the queue grow without bound when the disk falls
-  // behind the encoder: an unbounded backlog is the memory failure this fix removes.
-  const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
   // --- Elements ---
   const screenGrid = document.getElementById('screen-grid');
@@ -59,7 +56,7 @@
   let phase = 'idle'; // idle | starting | recording | finalizing
   let mediaRecorder = null;
   let recordStream = null;
-  let take = null; // per-recording write queue; see startRecording
+  let take = null; // per-recording sink (src/take.js); see startRecording
   let webcamStream = null;
   let micStream = null;
   let audioContext = null;
@@ -84,9 +81,9 @@
         // onstop already owns the file; aborting here would race its own commit
         await withTimeout(current.saved, 30000);
       } else if (current) {
-        current.closing = true; // stop queueing chunks the file will never receive
-        await withTimeout(current.chain.catch(() => {}), 10000);
-        await invoke('abort_recording').catch(() => null);
+        current.markClosing(); // stop queueing chunks the file will never receive
+        await withTimeout(current.drain().catch(() => {}), 10000);
+        await current.abort();
       } else {
         await invoke('abort_recording').catch(() => null);
       }
@@ -431,15 +428,21 @@
 
     // Open the output file first: a disk error must surface now, not after an hour
     // of recording. From here on every chunk goes straight to that file.
-    const current = { chain: Promise.resolve(), queued: 0, error: null, closing: false };
-    // Resolves once the file is closed and named, whether the take succeeded or not.
-    // The close handler waits on this instead of racing onstop for the same sink.
-    current.saved = new Promise((resolve) => { current.markSaved = resolve; });
+    // The take owns the ordered write queue, the backpressure bound, error
+    // latching and the saved promise the close handler waits on (src/take.js).
+    const current = createTake({
+      invoke,
+      // A write that fails must stop the take. Left running, the recorder would
+      // keep producing chunks that are dropped for as long as the user records.
+      onFail: () => stopRecording(),
+    });
     take = current;
     try {
-      await invoke('start_recording');
+      await current.start();
     } catch (e) {
-      current.markSaved();
+      // No sink was opened, but every exit still goes through abort(): it
+      // releases the saved promise the close handler may already be waiting on.
+      await current.abort();
       take = null;
       cleanupAfterRecording();
       setPhase('idle');
@@ -447,34 +450,16 @@
       return;
     }
 
-    // Stream each chunk to disk as it arrives. Nothing is retained in the webview, so
-    // no allocation ever scales with recording length. The chunk stays a Blob until its
-    // turn comes, and the chain keeps exactly one append in flight, so the bytes reach
-    // the file in the order MediaRecorder produced them.
+    // Stream each chunk to disk as it arrives; the ordering, backpressure and
+    // failure rules live inside the take (src/take.js).
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size === 0 || current.error || current.closing) return;
-      // An empty queue always takes the chunk: the bound is there to catch a backlog,
-      // not to reject one oversized chunk the disk could still have absorbed.
-      if (current.queued > 0 && current.queued + e.data.size > MAX_QUEUED_BYTES) {
-        failTake(current, new Error('Disk cannot keep up with the recording'));
-        return;
+      if (!current.queueChunk(e.data)) {
+        current.fail(new Error('Disk cannot keep up with the recording'));
       }
-      const chunk = e.data;
-      current.queued += chunk.size;
-      current.chain = current.chain
-        .then(async () => {
-          if (current.error) return;
-          const buffer = await chunk.arrayBuffer();
-          await invoke('append_recording_chunk', new Uint8Array(buffer));
-        })
-        .catch((err) => failTake(current, err))
-        .finally(() => {
-          current.queued -= chunk.size;
-        });
     };
 
     mediaRecorder.onerror = (e) => {
-      failTake(current, (e && e.error) || new Error('Recorder failed'));
+      current.fail((e && e.error) || new Error('Recorder failed'));
     };
 
     mediaRecorder.onstop = async () => {
@@ -487,22 +472,18 @@
 
       let savedPath;
       try {
-        await current.chain; // drain the appends still in flight
-        if (current.error) throw current.error;
+        await current.drain(); // drain the appends still in flight; rejects on a latched write error
         // A conversion rewrites the timestamps anyway, so only a kept WebM needs the fix
-        savedPath = await invoke('finish_recording', { remux: !doConvert });
+        savedPath = await current.commit(!doConvert);
       } catch (err) {
         // Whatever reached disk before the failure is kept under a .partial.webm name
-        const partial = await invoke('abort_recording').catch(() => null);
-        current.markSaved();
+        const partial = await current.abort();
         hideConvertProgress();
         setStatus('Error', 'error');
         showError(errText(err) + (partial ? ' — incomplete recording kept: ' + partial : ''));
         endTake(current);
         return;
       }
-      current.markSaved();
-
       hideConvertProgress();
       lastSavedPath = savedPath;
       btnPreview.disabled = false;
@@ -532,8 +513,7 @@
     try {
       mediaRecorder.start(1000);
     } catch (e) {
-      await invoke('abort_recording').catch(() => null);
-      current.markSaved();
+      await current.abort();
       take = null;
       cleanupAfterRecording();
       setPhase('idle');
@@ -565,14 +545,6 @@
         countdownIntervalId = setInterval(tick, 1000);
       }
     }
-  }
-
-  // A write that fails must stop the take. Left running, the recorder would keep
-  // producing chunks that are dropped on the floor for as long as the user records.
-  function failTake(t, err) {
-    if (t.error) return;
-    t.error = err;
-    stopRecording();
   }
 
   function endTake(t) {
@@ -698,7 +670,7 @@
       showError('Cannot start recording: ' + errText(e));
       if (phase !== 'starting') return;
       cleanupAfterRecording();
-      invoke('abort_recording').catch(() => null);
+      if (take) take.abort();
       take = null;
       setPhase('idle');
     });
