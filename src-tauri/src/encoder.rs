@@ -14,6 +14,8 @@ struct ConvertProgress {
     #[serde(rename = "fileName")]
     file_name: String,
     percent: u32,
+    /// "finalize" (metadata fix) or "convert" (MP4 transcode)
+    stage: String,
 }
 
 /// Locate ffmpeg: bundled resource -> FFMPEG_PATH env -> system PATH
@@ -44,16 +46,22 @@ fn captures_to_secs(caps: &regex::Captures) -> f64 {
     h * 3600.0 + m * 60.0 + s + frac
 }
 
-/// Run ffmpeg `-i input [args] -y output`, optionally emitting convert-progress events
+/// Run ffmpeg `[input_args] -i input [args] -y output`. FFmpeg applies an option to the
+/// next file on the command line, so demuxer flags belong in `input_args`, before `-i`.
+/// `stage` names the progress events to emit; `None` runs silently.
 fn run_ffmpeg(
     app: &AppHandle,
+    input_args: &[&str],
     input: &Path,
     output: &Path,
     args: &[&str],
-    emit_progress: bool,
+    stage: Option<&str>,
 ) -> Result<(), String> {
     let ffmpeg = ffmpeg_path(app);
     let mut cmd = Command::new(&ffmpeg);
+    for a in input_args {
+        cmd.arg(a);
+    }
     cmd.arg("-i").arg(input);
     for a in args {
         cmd.arg(a);
@@ -81,12 +89,13 @@ fn run_ffmpeg(
     let time_re = Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap();
 
     let emit = |percent: u32| {
-        if emit_progress {
+        if let Some(stage) = stage {
             let _ = app.emit(
                 "convert-progress",
                 ConvertProgress {
                     file_name: file_name.clone(),
                     percent,
+                    stage: stage.to_string(),
                 },
             );
         }
@@ -111,7 +120,7 @@ fn run_ffmpeg(
                 duration = Some(captures_to_secs(&caps));
             }
         }
-        if emit_progress {
+        if stage.is_some() {
             if let Some(d) = duration {
                 if d > 0.0 {
                     if let Some(caps) = time_re.captures_iter(&acc).last() {
@@ -125,14 +134,25 @@ fn run_ffmpeg(
                 }
             }
         }
+        // Keep a bounded tail. FFmpeg prints a progress line per frame, so holding the
+        // whole log and rescanning it on every read is quadratic over a long recording.
+        // Trim only once the duration header has been read, and never below a full line.
+        let cap = if duration.is_some() { 8192 } else { 262_144 };
+        if acc.len() > cap {
+            let target = acc.len() - cap / 2;
+            let cut = (target..acc.len())
+                .find(|i| acc.is_char_boundary(*i))
+                .unwrap_or(acc.len());
+            acc.drain(..cut);
+        }
     }
 
     let status = child
         .wait()
         .map_err(|e| format!("FFmpeg process error: {e}"))?;
-    emit(100);
 
     if status.success() {
+        emit(100);
         Ok(())
     } else {
         let tail: String = acc.chars().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect();
@@ -151,6 +171,9 @@ pub fn convert_to_mp4(
     output: &Path,
     emit_progress: bool,
 ) -> Result<(), String> {
+    let stage = if emit_progress { Some("convert") } else { None };
+    // MediaRecorder output carries no duration; fill in the missing PTS while decoding
+    let input_args = ["-fflags", "+genpts"];
     let args = [
         "-c:v", "libx264",
         "-preset", "fast",
@@ -165,7 +188,7 @@ pub fn convert_to_mp4(
         "-c:a", "aac",
         "-b:a", "128k",
     ];
-    run_ffmpeg(app, input, output, &args, emit_progress)
+    run_ffmpeg(app, &input_args, input, output, &args, stage)
 }
 
 /// Fast metadata fix for WebM: regenerate PTS for stable duration and seeking.
@@ -175,8 +198,22 @@ pub fn fix_webm_metadata(app: &AppHandle, webm_path: &Path) -> Result<(), String
         return Err("WebM file not found".into());
     }
     let fixed = webm_path.with_extension("genpts.webm");
-    run_ffmpeg(app, webm_path, &fixed, &["-fflags", "+genpts", "-c", "copy"], false)?;
-    std::fs::remove_file(webm_path).map_err(|e| e.to_string())?;
-    std::fs::rename(&fixed, webm_path).map_err(|e| e.to_string())?;
+    if let Err(e) = run_ffmpeg(
+        app,
+        &["-fflags", "+genpts"],
+        webm_path,
+        &fixed,
+        &["-c", "copy"],
+        Some("finalize"),
+    ) {
+        let _ = std::fs::remove_file(&fixed); // don't leave a half-written copy behind
+        return Err(e);
+    }
+    // Rename over the original rather than deleting it first: a failure here leaves the
+    // recording readable at its own path instead of leaving nothing at all.
+    std::fs::rename(&fixed, webm_path).map_err(|e| {
+        let _ = std::fs::remove_file(&fixed);
+        e.to_string()
+    })?;
     Ok(())
 }
