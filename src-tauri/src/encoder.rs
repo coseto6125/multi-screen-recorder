@@ -46,27 +46,29 @@ fn captures_to_secs(caps: &regex::Captures) -> f64 {
     h * 3600.0 + m * 60.0 + s + frac
 }
 
-/// Run ffmpeg `[input_args] -i input [args] -y output`. FFmpeg applies an option to the
-/// next file on the command line, so demuxer flags belong in `input_args`, before `-i`.
+/// One ffmpeg invocation: run `[input_args] -i input [args] -y output`. FFmpeg applies
+/// an option to the next file on the command line, so demuxer flags belong in
+/// `input_args`, before `-i`; encoder and muxer flags follow in `args`.
 /// `stage` names the progress events to emit; `None` runs silently.
-fn run_ffmpeg(
-    app: &AppHandle,
-    input_args: &[&str],
-    input: &Path,
-    output: &Path,
-    args: &[&str],
-    stage: Option<&str>,
-) -> Result<(), String> {
+struct FfmpegJob<'a> {
+    input_args: &'a [&'a str],
+    input: &'a Path,
+    output: &'a Path,
+    args: &'a [&'a str],
+    stage: Option<&'a str>,
+}
+
+fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
     let ffmpeg = ffmpeg_path(app);
     let mut cmd = Command::new(&ffmpeg);
-    for a in input_args {
+    for a in job.input_args {
         cmd.arg(a);
     }
-    cmd.arg("-i").arg(input);
-    for a in args {
+    cmd.arg("-i").arg(job.input);
+    for a in job.args {
         cmd.arg(a);
     }
-    cmd.arg("-y").arg(output);
+    cmd.arg("-y").arg(job.output);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -80,7 +82,8 @@ fn run_ffmpeg(
         .map_err(|e| format!("FFmpeg not found or failed to start: {e}"))?;
     let mut stderr = child.stderr.take().expect("stderr piped");
 
-    let file_name = input
+    let file_name = job
+        .input
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -89,7 +92,7 @@ fn run_ffmpeg(
     let time_re = Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap();
 
     let emit = |percent: u32| {
-        if let Some(stage) = stage {
+        if let Some(stage) = job.stage {
             let _ = app.emit(
                 "convert-progress",
                 ConvertProgress {
@@ -120,7 +123,7 @@ fn run_ffmpeg(
                 duration = Some(captures_to_secs(&caps));
             }
         }
-        if stage.is_some() {
+        if job.stage.is_some() {
             if let Some(d) = duration {
                 if d > 0.0 {
                     if let Some(caps) = time_re.captures_iter(&acc).last() {
@@ -172,23 +175,29 @@ pub fn convert_to_mp4(
     emit_progress: bool,
 ) -> Result<(), String> {
     let stage = if emit_progress { Some("convert") } else { None };
-    // MediaRecorder output carries no duration; fill in the missing PTS while decoding
-    let input_args = ["-fflags", "+genpts"];
-    let args = [
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-g", "120",
-        "-keyint_min", "120",
-        "-sc_threshold", "0",
-        "-vsync", "cfr",
-        "-r", "60",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-c:a", "aac",
-        "-b:a", "128k",
-    ];
-    run_ffmpeg(app, &input_args, input, output, &args, stage)
+    let job = FfmpegJob {
+        // MediaRecorder output carries no duration; fill in the missing PTS while decoding
+        input_args: &["-fflags", "+genpts"],
+        input,
+        output,
+        // H.264 - 60 fps, keyframe every 2s (GOP=120), yuv420p, faststart
+        args: &[
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-g", "120",
+            "-keyint_min", "120",
+            "-sc_threshold", "0",
+            "-vsync", "cfr",
+            "-r", "60",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+            "-b:a", "128k",
+        ],
+        stage,
+    };
+    run_ffmpeg(app, &job)
 }
 
 /// Fast metadata fix for WebM: regenerate PTS for stable duration and seeking.
@@ -198,14 +207,14 @@ pub fn fix_webm_metadata(app: &AppHandle, webm_path: &Path) -> Result<(), String
         return Err("WebM file not found".into());
     }
     let fixed = webm_path.with_extension("genpts.webm");
-    if let Err(e) = run_ffmpeg(
-        app,
-        &["-fflags", "+genpts"],
-        webm_path,
-        &fixed,
-        &["-c", "copy"],
-        Some("finalize"),
-    ) {
+    let job = FfmpegJob {
+        input_args: &["-fflags", "+genpts"],
+        input: webm_path,
+        output: &fixed,
+        args: &["-c", "copy"],
+        stage: Some("finalize"),
+    };
+    if let Err(e) = run_ffmpeg(app, &job) {
         let _ = std::fs::remove_file(&fixed); // don't leave a half-written copy behind
         return Err(e);
     }
