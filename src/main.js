@@ -60,8 +60,8 @@ let phase = 'idle'; // idle | starting | recording | finalizing
   let take = null; // per-recording sink (src/take.js); see startRecording
   let webcamStream = null;
   let micStream = null;
-  let audioContext = null;
-  let compositeCleanups = [];
+  let composite = null; // grid composite handle (src/compositor.js)
+  let mergedAudio = null; // audio merge handle (src/compositor.js)
   let durationInterval = null;
   let startTime = null;
   let stopTimeoutId = null;
@@ -243,105 +243,6 @@ let phase = 'idle'; // idle | starting | recording | finalizing
     });
   }
 
-  // --- Audio merge ---
-  function mergeAudioStreams(systemStream, mic) {
-    audioContext = new AudioContext();
-    const destination = audioContext.createMediaStreamDestination();
-    if (systemStream && systemStream.getAudioTracks().length > 0) {
-      audioContext.createMediaStreamSource(systemStream).connect(destination);
-    }
-    if (mic && mic.getAudioTracks().length > 0) {
-      audioContext.createMediaStreamSource(mic).connect(destination);
-    }
-    return destination.stream;
-  }
-
-  // --- Canvas composition ---
-  // Lays screens out in a grid (1 -> 1x1, 2 -> 2x1, 3-4 -> 2x2), each cell letterboxed,
-  // then scales the whole canvas down (never up) to fit within maxW x maxH.
-  // Uses rAF plus an interval fallback so drawing continues when the window is occluded.
-  function startComposite(screenStreams, webcamTrack, maxW, maxH) {
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    const videos = screenStreams.map((s) => {
-      const v = document.createElement('video');
-      v.autoplay = true;
-      v.muted = true;
-      v.srcObject = s;
-      v.play().catch(() => {});
-      return v;
-    });
-
-    let webcamVideo = null;
-    if (webcamTrack) {
-      webcamVideo = document.createElement('video');
-      webcamVideo.autoplay = true;
-      webcamVideo.muted = true;
-      webcamVideo.srcObject = new MediaStream([webcamTrack]);
-      webcamVideo.play().catch(() => {});
-    }
-
-    const n = videos.length;
-    const cols = n <= 1 ? 1 : 2;
-    const rows = Math.ceil(n / cols);
-
-    function draw() {
-      if (!videos.every((v) => v.videoWidth > 0)) return;
-      // Uniform cells sized by the largest source, capped to the selected resolution
-      const cellW = Math.max(...videos.map((v) => v.videoWidth));
-      const cellH = Math.max(...videos.map((v) => v.videoHeight));
-      const naturalW = cols * cellW;
-      const naturalH = rows * cellH;
-      const scale = Math.min(1, maxW / naturalW, maxH / naturalH);
-      const outW = Math.max(2, Math.round((naturalW * scale) / 2) * 2);
-      const outH = Math.max(2, Math.round((naturalH * scale) / 2) * 2);
-      if (canvas.width !== outW || canvas.height !== outH) {
-        canvas.width = outW;
-        canvas.height = outH;
-      }
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, outW, outH);
-      const cw = outW / cols;
-      const ch = outH / rows;
-      videos.forEach((v, i) => {
-        const cx = (i % cols) * cw;
-        const cy = Math.floor(i / cols) * ch;
-        const s = Math.min(cw / v.videoWidth, ch / v.videoHeight);
-        const dw = v.videoWidth * s;
-        const dh = v.videoHeight * s;
-        ctx.drawImage(v, cx + (cw - dw) / 2, cy + (ch - dh) / 2, dw, dh);
-      });
-      if (webcamVideo && webcamVideo.videoWidth) {
-        const padding = Math.max(8, Math.round(outW * 0.01));
-        const w = Math.floor(outW * 0.2);
-        const h = Math.floor(w * (webcamVideo.videoHeight / webcamVideo.videoWidth));
-        ctx.drawImage(webcamVideo, outW - w - padding, outH - h - padding, w, h);
-      }
-    }
-
-    let animId;
-    function loop() {
-      draw();
-      animId = requestAnimationFrame(loop);
-    }
-    animId = requestAnimationFrame(loop);
-    const intervalId = setInterval(draw, 33); // keeps drawing if rAF is throttled
-
-    compositeCleanups.push(() => {
-      cancelAnimationFrame(animId);
-      clearInterval(intervalId);
-      videos.forEach((v) => { v.srcObject = null; });
-      if (webcamVideo) webcamVideo.srcObject = null;
-    });
-
-    return canvas.captureStream(60);
-  }
-
-  function stopComposite() {
-    compositeCleanups.forEach((cb) => cb());
-    compositeCleanups = [];
-  }
-
   // --- Recording ---
   async function startRecording() {
     if (phase !== 'idle') return; // permissions and IPC below await; a second entry would race
@@ -391,12 +292,13 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       (settings0.width || 0) > maxRes.w || (settings0.height || 0) > maxRes.h;
     const needComposite = screens.length > 1 || (useWebcam && webcamStream) || exceedsCap;
     if (needComposite) {
-      canvasStream = startComposite(
-        screens.map((s) => s.stream),
-        useWebcam && webcamStream ? webcamStream.getVideoTracks()[0] : null,
-        maxRes.w,
-        maxRes.h
-      );
+      composite = gridCompositor.createGridComposite({
+        streams: screens.map((s) => s.stream),
+        webcamTrack: useWebcam && webcamStream ? webcamStream.getVideoTracks()[0] : null,
+        maxW: maxRes.w,
+        maxH: maxRes.h,
+      });
+      canvasStream = composite.stream;
       videoTrack = canvasStream.getVideoTracks()[0];
     } else {
       videoTrack = track0;
@@ -405,8 +307,13 @@ let phase = 'idle'; // idle | starting | recording | finalizing
     // Audio: system audio comes from the first screen's display stream (if shared)
     const tracks = [videoTrack];
     if (useMic || useSystemAudio) {
-      const merged = mergeAudioStreams(useSystemAudio ? screens[0].stream : null, useMic ? micStream : null);
-      if (merged.getAudioTracks().length > 0) tracks.push(merged.getAudioTracks()[0]);
+      mergedAudio = gridCompositor.mergeAudio(
+        useSystemAudio ? screens[0].stream : null,
+        useMic ? micStream : null
+      );
+      if (mergedAudio.stream.getAudioTracks().length > 0) {
+        tracks.push(mergedAudio.stream.getAudioTracks()[0]);
+      }
     }
     recordStream = new MediaStream(tracks);
 
@@ -561,7 +468,10 @@ let phase = 'idle'; // idle | starting | recording | finalizing
 
   function cleanupAfterRecording() {
     // Screens keep streaming for the next take; only stop recording-specific resources
-    stopComposite();
+    if (composite) {
+      composite.stop();
+      composite = null;
+    }
     if (recordStream) {
       // Only stop tracks we created (canvas/merged audio), not the live screen tracks
       recordStream.getTracks().forEach((t) => {
@@ -578,9 +488,9 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       micStream.getTracks().forEach((t) => t.stop());
       micStream = null;
     }
-    if (audioContext) {
-      audioContext.close().catch(() => {});
-      audioContext = null;
+    if (mergedAudio) {
+      mergedAudio.stop();
+      mergedAudio = null;
     }
     mediaRecorder = null;
   }
