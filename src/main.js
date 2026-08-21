@@ -10,6 +10,9 @@
   const appWindow = window.__TAURI__.window.getCurrentWindow();
 
   const MAX_SCREENS = 4;
+  // Stop the take rather than let the queue grow without bound when the disk falls
+  // behind the encoder: an unbounded backlog is the memory failure this fix removes.
+  const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
   // --- Elements ---
   const screenGrid = document.getElementById('screen-grid');
@@ -53,10 +56,10 @@
   let selectedCodec = 'vp8';
   let selectedBitrate = 3000000;
   let maxRes = { w: 1920, h: 1080 };
-  let isRecording = false;
+  let phase = 'idle'; // idle | starting | recording | finalizing
   let mediaRecorder = null;
-  let recordedChunks = [];
   let recordStream = null;
+  let take = null; // per-recording write queue; see startRecording
   let webcamStream = null;
   let micStream = null;
   let audioContext = null;
@@ -69,6 +72,28 @@
 
   // --- Titlebar ---
   document.getElementById('tl-close').addEventListener('click', () => appWindow.close());
+  // Covers the titlebar button and Alt-F4 alike: the file gets closed and named before
+  // the webview goes away, so a take in progress survives the close instead of vanishing.
+  appWindow.onCloseRequested(async (event) => {
+    if (phase === 'idle') return; // not prevented: the window closes as usual
+    event.preventDefault();
+    try {
+      setStatus('Saving recording…', 'busy');
+      const current = take;
+      if (phase === 'finalizing' && current) {
+        // onstop already owns the file; aborting here would race its own commit
+        await withTimeout(current.saved, 30000);
+      } else if (current) {
+        current.closing = true; // stop queueing chunks the file will never receive
+        await withTimeout(current.chain.catch(() => {}), 10000);
+        await invoke('abort_recording').catch(() => null);
+      } else {
+        await invoke('abort_recording').catch(() => null);
+      }
+    } finally {
+      await appWindow.destroy();
+    }
+  });
   document.getElementById('tl-min').addEventListener('click', () => appWindow.minimize());
   document.getElementById('tl-max').addEventListener('click', () => appWindow.toggleMaximize());
 
@@ -95,21 +120,47 @@
       sourceHint.textContent = screens.length + ' screen' + (screens.length > 1 ? 's' : '') +
         ' added' + (layout ? ' — combined as a ' + layout + ' grid in a single video.' : '.');
     }
-    btnAddScreen.disabled = screens.length >= MAX_SCREENS || isRecording;
+    btnAddScreen.disabled = screens.length >= MAX_SCREENS || phase !== 'idle';
     screenEmpty.classList.toggle('hidden', screens.length > 0);
   }
 
-  function showConvertProgress(fileName) {
+  // One place decides what the controls look like, so a take can never leave the UI
+  // claiming it is idle while its file is still open.
+  function setPhase(next) {
+    phase = next;
+    btnRecord.disabled = next === 'starting' || next === 'finalizing';
+    btnRecord.classList.toggle('recording', next === 'recording');
+    btnRecord.title = next === 'recording' ? 'Stop recording' : 'Start recording';
+    recIndicator.classList.toggle('hidden', next !== 'recording');
+    btnConvertFile.disabled = next !== 'idle';
+    updateHint();
+  }
+
+  function showConvertProgress(fileName, verb) {
     convertProgressEl.classList.remove('hidden');
-    convertProgressLabel.textContent = 'Converting ' + (fileName || '…');
+    convertProgressLabel.textContent = (verb || 'Converting') + ' ' + (fileName || '…');
     convertProgressFill.style.width = '0%';
     convertProgressPct.textContent = '0%';
   }
 
-  function updateConvertProgress(percent, fileName) {
+  function updateConvertProgress(percent, fileName, verb) {
     convertProgressFill.style.width = percent + '%';
     convertProgressPct.textContent = percent + '%';
-    if (fileName) convertProgressLabel.textContent = 'Converting ' + fileName;
+    if (fileName) convertProgressLabel.textContent = (verb || 'Converting') + ' ' + fileName;
+  }
+
+  // A stalled disk or a wedged ffmpeg must not trap the user in a window that will
+  // not close, so every wait on the way out is bounded.
+  function withTimeout(promise, ms) {
+    return Promise.race([
+      promise,
+      new Promise((resolve) => setTimeout(resolve, ms))
+    ]);
+  }
+
+  function errText(err) {
+    if (!err) return 'Unknown error';
+    return String(err.message || err);
   }
 
   function hideConvertProgress() {
@@ -167,8 +218,8 @@
     // If user stops sharing from the OS/browser UI
     if (track) {
       track.addEventListener('ended', () => {
-        if (isRecording) stopRecording();
-        removeScreen(id);
+        stopRecording();
+        removeScreen(id, true);
       });
     }
 
@@ -176,10 +227,11 @@
     updateHint();
   }
 
-  function removeScreen(id) {
+  // `force` is for a source that has already ended: its tile must go even mid-take.
+  function removeScreen(id, force) {
     const idx = screens.findIndex((s) => s.id === id);
     if (idx < 0) return;
-    if (isRecording) return; // don't remove mid-recording (except via track ended -> stop first)
+    if (!force && phase !== 'idle') return;
     const [entry] = screens.splice(idx, 1);
     entry.stream.getTracks().forEach((t) => t.stop());
     entry.tile.remove();
@@ -294,11 +346,13 @@
 
   // --- Recording ---
   async function startRecording() {
+    if (phase !== 'idle') return; // permissions and IPC below await; a second entry would race
     showError('');
     if (screens.length === 0) {
       showError('Please add at least one screen first.');
       return;
     }
+    setPhase('starting');
 
     const useMic = toggleMic.checked;
     const useSystemAudio = toggleSystemAudio.checked;
@@ -312,6 +366,7 @@
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch (e) {
         showError('Microphone not available: ' + (e.message || 'permission denied'));
+        setPhase('idle');
         return;
       }
     }
@@ -323,6 +378,7 @@
         showError('Webcam not available: ' + (e.message || 'permission denied'));
         if (micStream) micStream.getTracks().forEach((t) => t.stop());
         micStream = null;
+        setPhase('idle');
         return;
       }
     }
@@ -363,7 +419,6 @@
     } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
       mimeType = 'video/webm;codecs=vp8';
     }
-    let recorderMime = mimeType;
     try {
       mediaRecorder = new MediaRecorder(recordStream, {
         mimeType,
@@ -372,53 +427,123 @@
       });
     } catch (e) {
       mediaRecorder = new MediaRecorder(recordStream);
-      recorderMime = 'video/webm';
     }
 
-    recordedChunks = [];
+    // Open the output file first: a disk error must surface now, not after an hour
+    // of recording. From here on every chunk goes straight to that file.
+    const current = { chain: Promise.resolve(), queued: 0, error: null, closing: false };
+    // Resolves once the file is closed and named, whether the take succeeded or not.
+    // The close handler waits on this instead of racing onstop for the same sink.
+    current.saved = new Promise((resolve) => { current.markSaved = resolve; });
+    take = current;
+    try {
+      await invoke('start_recording');
+    } catch (e) {
+      current.markSaved();
+      take = null;
+      cleanupAfterRecording();
+      setPhase('idle');
+      showError('Cannot start recording: ' + errText(e));
+      return;
+    }
+
+    // Stream each chunk to disk as it arrives. Nothing is retained in the webview, so
+    // no allocation ever scales with recording length. The chunk stays a Blob until its
+    // turn comes, and the chain keeps exactly one append in flight, so the bytes reach
+    // the file in the order MediaRecorder produced them.
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
+      if (e.data.size === 0 || current.error || current.closing) return;
+      // An empty queue always takes the chunk: the bound is there to catch a backlog,
+      // not to reject one oversized chunk the disk could still have absorbed.
+      if (current.queued > 0 && current.queued + e.data.size > MAX_QUEUED_BYTES) {
+        failTake(current, new Error('Disk cannot keep up with the recording'));
+        return;
+      }
+      const chunk = e.data;
+      current.queued += chunk.size;
+      current.chain = current.chain
+        .then(async () => {
+          if (current.error) return;
+          const buffer = await chunk.arrayBuffer();
+          await invoke('append_recording_chunk', new Uint8Array(buffer));
+        })
+        .catch((err) => failTake(current, err))
+        .finally(() => {
+          current.queued -= chunk.size;
+        });
     };
+
+    mediaRecorder.onerror = (e) => {
+      failTake(current, (e && e.error) || new Error('Recorder failed'));
+    };
+
     mediaRecorder.onstop = async () => {
       clearAutoStop();
       stopDurationTimer();
-      setStatus('Processing…', 'busy');
+      setStatus('Finalizing…', 'busy');
 
-      const blob = new Blob(recordedChunks, { type: recorderMime });
-      recordedChunks = [];
       const doConvert = toggleConvertMp4.checked;
       cleanupAfterRecording();
 
+      let savedPath;
       try {
-        const buffer = await blob.arrayBuffer();
-        let savedPath = await invoke('save_webm', new Uint8Array(buffer));
-        if (doConvert) {
-          setStatus('Converting to MP4…', 'busy');
-          showConvertProgress(baseName(savedPath));
-          savedPath = await invoke('convert_to_mp4', { webmPath: savedPath });
-        }
-        hideConvertProgress();
-        lastSavedPath = savedPath;
-        btnPreview.disabled = false;
-        setStatus('Saved: ' + baseName(savedPath));
+        await current.chain; // drain the appends still in flight
+        if (current.error) throw current.error;
+        // A conversion rewrites the timestamps anyway, so only a kept WebM needs the fix
+        savedPath = await invoke('finish_recording', { remux: !doConvert });
       } catch (err) {
+        // Whatever reached disk before the failure is kept under a .partial.webm name
+        const partial = await invoke('abort_recording').catch(() => null);
+        current.markSaved();
         hideConvertProgress();
         setStatus('Error', 'error');
-        showError(String(err && err.message ? err.message : err));
+        showError(errText(err) + (partial ? ' — incomplete recording kept: ' + partial : ''));
+        endTake(current);
+        return;
       }
+      current.markSaved();
+
+      hideConvertProgress();
+      lastSavedPath = savedPath;
+      btnPreview.disabled = false;
+      setStatus('Saved: ' + baseName(savedPath));
+      if (!doConvert) {
+        endTake(current);
+        return;
+      }
+
+      // The WebM is already safe on disk; a failed conversion must not lose it
+      try {
+        setStatus('Converting to MP4…', 'busy');
+        showConvertProgress(baseName(savedPath));
+        const mp4Path = await invoke('convert_to_mp4', { webmPath: savedPath });
+        lastSavedPath = mp4Path;
+        setStatus('Saved: ' + baseName(mp4Path));
+      } catch (err) {
+        setStatus('Error', 'error');
+        showError('MP4 conversion failed, WebM kept: ' + errText(err));
+      }
+      hideConvertProgress();
+      endTake(current);
     };
 
-    // timeslice 1000 ms: flush every 1s = regular keyframes, stable duration
-    mediaRecorder.start(1000);
-    isRecording = true;
+    // timeslice 1000 ms: hand a chunk over every second, so at most one second of
+    // recording is ever in flight rather than sitting in the webview
+    try {
+      mediaRecorder.start(1000);
+    } catch (e) {
+      await invoke('abort_recording').catch(() => null);
+      current.markSaved();
+      take = null;
+      cleanupAfterRecording();
+      setPhase('idle');
+      showError('Cannot start recording: ' + errText(e));
+      return;
+    }
     startTime = Date.now();
     startDurationTimer();
     setStatus('Recording…', 'recording');
-    recIndicator.classList.remove('hidden');
-    btnRecord.classList.add('recording');
-    btnRecord.title = 'Stop recording';
-    btnAddScreen.disabled = true;
-    btnConvertFile.disabled = true;
+    setPhase('recording');
 
     // Auto-stop timer
     if (toggleStopTimer.checked) {
@@ -440,6 +565,19 @@
         countdownIntervalId = setInterval(tick, 1000);
       }
     }
+  }
+
+  // A write that fails must stop the take. Left running, the recorder would keep
+  // producing chunks that are dropped on the floor for as long as the user records.
+  function failTake(t, err) {
+    if (t.error) return;
+    t.error = err;
+    stopRecording();
+  }
+
+  function endTake(t) {
+    if (take === t) take = null;
+    setPhase('idle');
   }
 
   function clearAutoStop() {
@@ -474,16 +612,16 @@
     mediaRecorder = null;
   }
 
+  // Only onstop returns the phase to idle, so the record button stays disabled until
+  // the file this take opened is closed.
   function stopRecording() {
-    if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+    if (phase !== 'recording') return;
+    setPhase('finalizing');
     clearAutoStop();
+    // The recorder stops itself once every track has ended, and stop() then throws;
+    // its own onstop still runs and closes the take, so there is nothing to do here.
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
     mediaRecorder.stop();
-    isRecording = false;
-    recIndicator.classList.add('hidden');
-    btnRecord.classList.remove('recording');
-    btnRecord.title = 'Start recording';
-    btnConvertFile.disabled = false;
-    updateHint();
   }
 
   function startDurationTimer() {
@@ -541,16 +679,29 @@
 
   // --- Events from backend ---
   listen('convert-progress', (event) => {
-    const { fileName, percent } = event.payload;
-    if (convertProgressEl.classList.contains('hidden')) showConvertProgress(fileName);
-    updateConvertProgress(percent, fileName);
+    const { fileName, percent, stage } = event.payload;
+    const verb = stage === 'finalize' ? 'Finalizing' : 'Converting';
+    if (convertProgressEl.classList.contains('hidden')) showConvertProgress(fileName, verb);
+    updateConvertProgress(percent, fileName, verb);
   });
 
   // --- UI wiring ---
   btnAddScreen.addEventListener('click', addScreen);
   btnRecord.addEventListener('click', () => {
-    if (isRecording) stopRecording();
-    else startRecording();
+    if (phase === 'recording') {
+      stopRecording();
+      return;
+    }
+    // Nothing awaits startRecording, so an unexpected throw would otherwise strand the
+    // phase at 'starting' and leave the record button disabled for the rest of the session
+    startRecording().catch((e) => {
+      showError('Cannot start recording: ' + errText(e));
+      if (phase !== 'starting') return;
+      cleanupAfterRecording();
+      invoke('abort_recording').catch(() => null);
+      take = null;
+      setPhase('idle');
+    });
   });
   btnPreview.addEventListener('click', showPreview);
   btnConvertFile.addEventListener('click', convertFile);
@@ -618,6 +769,6 @@
       recordingsPathEl.title = p || '';
     })
     .catch(() => {});
-  updateHint();
+  setPhase('idle');
   setStatus('Ready');
 })();

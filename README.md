@@ -81,12 +81,14 @@ npm run build   # build the NSIS installer -> src-tauri/target/release/bundle/ns
 src/                      # Frontend — vanilla HTML/CSS/JS, no bundler (withGlobalTauri)
   main.js                 #   getDisplayMedia capture, canvas grid compositor, MediaRecorder
 src-tauri/
-  src/main.rs             # Settings, save recordings (raw IPC), folder dialogs
+  src/main.rs             # Settings, streaming recording sink (raw IPC), folder dialogs
   src/encoder.rs          # FFmpeg: MP4 encode with progress events, WebM PTS fix
   binaries/ffmpeg.exe     # Bundled FFmpeg (release resource, not in git)
 ```
 
-**Recording pipeline:** `getDisplayMedia` per screen → canvas grid composition @60fps (scaled to the resolution cap) → `MediaRecorder` (WebM, 1s timeslice) → raw-IPC save → FFmpeg `+genpts` remux → optional H.264 MP4 encode.
+**Recording pipeline:** `getDisplayMedia` per screen → canvas grid composition @60fps (scaled to the resolution cap) → `MediaRecorder` (WebM, 1s timeslice) → each chunk appended to an open file over raw IPC → FFmpeg `+genpts` remux, or a direct H.264 MP4 encode when MP4 output is on.
+
+Chunks are written as they arrive, so memory stays flat no matter how long a recording runs and an interrupted session leaves a playable file behind. A recording in progress lives at `recording-<stamp>.webm.part`; it is renamed to `.webm` on a clean stop, or to `.partial.webm` if the take is interrupted.
 
 ## 📄 License
 
