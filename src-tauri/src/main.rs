@@ -584,6 +584,9 @@ mod tests {
 
         assert_eq!(first.part_path, dir.join("rec.webm.part"));
         assert_eq!(second.part_path, dir.join("rec-2.webm.part"));
+        // Windows refuses to delete files that are still open, so close both sinks first
+        drop(first);
+        drop(second);
         fs::remove_dir_all(&dir).unwrap();
     }
 
