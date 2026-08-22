@@ -1,0 +1,57 @@
+name: release-build
+
+# Builds the Windows NSIS installer and attaches it to a release.
+# Triggered by pushing a v* tag, or manually for an existing tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to attach artifacts to (e.g. v1.1.0)'
+        required: true
+        default: v1.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  windows-nsis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo registry + git and the target dir keyed on Cargo.lock,
+      # so only crates that actually changed rebuild after the first run.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The NSIS bundle packs binaries/ffmpeg.exe as a resource; the repo
+      # carries only a placeholder stub, so fetch a pinned real build first.
+      - name: Fetch ffmpeg for the bundle resource
+        shell: pwsh
+        run: |
+          $z = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+          Invoke-WebRequest 'https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip' -OutFile $z
+          Expand-Archive $z (Join-Path $env:RUNNER_TEMP 'ffmpeg') -Force
+          Copy-Item "$env:RUNNER_TEMP\ffmpeg\ffmpeg-7.1-essentials_build\bin\ffmpeg.exe" src-tauri/binaries/ffmpeg.exe -Force
+
+      - name: Install JS dependencies
+        run: npm install
+
+      - name: Build Windows installer
+        run: npx tauri build
+
+      - name: Attach installer to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || inputs.tag_name }}
+          files: src-tauri/target/release/bundle/nsis/*.exe
