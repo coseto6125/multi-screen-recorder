@@ -370,23 +370,35 @@ fn start_recording(state: State<'_, AppState>) -> Result<String, String> {
     Ok(path)
 }
 
-// Append one MediaRecorder chunk (raw IPC body) to the open file. Writes straight from
-// the borrowed IPC buffer, so nothing is copied and nothing accumulates in memory.
+// Append one MediaRecorder chunk (raw IPC body) to the open file. The IPC buffer is
+// cloned once per chunk to cross into the blocking pool; chunks arrive once per second
+// (1000 ms timeslice), so this copies a few hundred KB at a time and nothing
+// accumulates in memory. The write runs on a blocking-pool thread: a slow disk write
+// must not stall a tokio worker that other IPC calls and progress events share.
 #[tauri::command(async)]
-fn append_recording_chunk(
-    state: State<'_, AppState>,
+async fn append_recording_chunk(
+    app: AppHandle,
     request: tauri::ipc::Request<'_>,
 ) -> Result<(), String> {
     let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
         return Err("Invalid recording data (expected raw bytes)".into());
     };
-    state
-        .take
-        .lock()
-        .unwrap()
-        .current()?
-        .append(data)
-        .map_err(|e| format!("Cannot write recording: {e}"))
+    let data = data.clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        // Bind to a local so the lock-guard temporary drops before `state`
+        let wrote = state
+            .take
+            .lock()
+            .unwrap()
+            .current()?
+            .append(&data)
+            .map_err(|e| format!("Cannot write recording: {e}"));
+        wrote
+    })
+    .await
+    .map_err(|e| format!("Cannot write recording: {e}"))?;
+    written
 }
 
 // Close the file and return the final path. `remux` runs the metadata fix; skip it when
