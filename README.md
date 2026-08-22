@@ -88,7 +88,7 @@ src-tauri/
 
 **Recording pipeline:** `getDisplayMedia` per screen → canvas grid composition @60fps (scaled to the resolution cap) → `MediaRecorder` (WebM, 1s timeslice) → each chunk appended to an open file over raw IPC → FFmpeg `+genpts` remux, or a direct H.264 MP4 encode when MP4 output is on.
 
-Chunks are written as they arrive, so memory stays flat no matter how long a recording runs and an interrupted session leaves a playable file behind. A recording in progress lives at `recording-<stamp>.webm.part`; it is renamed to `.webm` on a clean stop, or to `.partial.webm` if the take is interrupted.
+Chunks are written as they arrive, so memory stays flat no matter how long a recording runs, and an interrupted take keeps the bytes that reached disk. A recording in progress lives at `recording-<stamp>.webm.part`; it is renamed to `.webm` on a clean stop, or to `.partial.webm` if the take is interrupted.
 
 ## 📄 License
 
