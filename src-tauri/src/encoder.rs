@@ -4,10 +4,18 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager};
+
+// Compiled once per process: run_ffmpeg runs per conversion, and recompiling the
+// progress patterns on every call is pure overhead.
+static DURATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap());
+static TIME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap());
 
 #[derive(Clone, serde::Serialize)]
 struct ConvertProgress {
@@ -88,9 +96,6 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let dur_re = Regex::new(r"Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap();
-    let time_re = Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{1,3})").unwrap();
-
     let emit = |percent: u32| {
         if let Some(stage) = job.stage {
             let _ = app.emit(
@@ -119,14 +124,14 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
         }
         acc.push_str(&String::from_utf8_lossy(&buf[..n]));
         if duration.is_none() {
-            if let Some(caps) = dur_re.captures(&acc) {
+            if let Some(caps) = DURATION_RE.captures(&acc) {
                 duration = Some(captures_to_secs(&caps));
             }
         }
         if job.stage.is_some() {
             if let Some(d) = duration {
                 if d > 0.0 {
-                    if let Some(caps) = time_re.captures_iter(&acc).last() {
+                    if let Some(caps) = TIME_RE.captures_iter(&acc).last() {
                         let current = captures_to_secs(&caps);
                         let pct = ((current / d) * 100.0).round().min(99.0) as i64;
                         if pct != last_pct {
