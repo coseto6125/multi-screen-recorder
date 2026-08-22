@@ -282,6 +282,15 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       }
     }
 
+    // Every screen can end while the permission prompts above are pending; a
+    // take with no screens would dereference screens[0] below.
+    if (screens.length === 0) {
+      cleanupAfterRecording();
+      setPhase('idle');
+      showError('All screens were disconnected before recording could start.');
+      return;
+    }
+
     // Video track: single screen within the resolution cap and no webcam records
     // directly; otherwise composite through the canvas (grid + scaling)
     let videoTrack;
