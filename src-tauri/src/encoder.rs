@@ -144,9 +144,12 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
                 }
             }
         }
-        // Keep a bounded tail. FFmpeg prints a progress line per frame, so holding the
-        // whole log and rescanning it on every read is quadratic over a long recording.
-        // Trim only once the duration header has been read, and never below a full line.
+        // Keep a bounded tail. FFmpeg prints a status line about twice a second, so
+        // holding the whole log and rescanning it on every read is quadratic over a
+        // long encode. Trim once a total is known, from the header or the caller's
+        // estimate. The cut lands on a char boundary rather than a line break, which
+        // is safe: the scans above run first and take the newest match, and the
+        // retained tail is over 4 KiB, hundreds of times the length of one match.
         let cap = if total.is_some() { 8192 } else { 262_144 };
         if acc.len() > cap {
             let target = acc.len() - cap / 2;
