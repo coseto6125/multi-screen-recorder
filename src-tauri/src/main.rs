@@ -15,6 +15,31 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+#[cfg(test)]
+struct CreateNameCheckHook {
+    part_path: PathBuf,
+    checked: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static CREATE_NAME_CHECK_HOOK: Mutex<Option<CreateNameCheckHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn pause_after_name_check(part_path: &Path) {
+    let hook = {
+        let mut slot = CREATE_NAME_CHECK_HOOK.lock().unwrap();
+        (slot
+            .as_ref()
+            .is_some_and(|hook| hook.part_path == part_path))
+        .then(|| slot.take().unwrap())
+    };
+    if let Some(hook) = hook {
+        hook.checked.wait();
+        hook.resume.wait();
+    }
+}
+
 struct AppState {
     recordings_dir: Mutex<PathBuf>,
     /// One take's slot: the backend side of the recording-open fact
@@ -38,14 +63,9 @@ struct RecordingSink {
 }
 
 impl RecordingSink {
-    /// Creates `<stem>.webm.part`, never overwriting an existing recording.
-    ///
-    /// **Call this under the take lock, and rename a `.part` file away under the same
-    /// lock.** Only the `.part` name is reserved atomically, by `create_new`. The
-    /// final and partial names are picked with a plain `exists()` check, so those
-    /// checks and the `create_new` below are one check-then-act. A rename that frees
-    /// a `.part` name inside another take's window lets that take claim it, and its
-    /// final name is then the earlier recording.
+    /// Creates `<stem>.webm.part`, never overwriting an existing recording. After the
+    /// atomic create reserves the part name, the other two names are checked again: a
+    /// rename that freed the part inside the first check's window must already be visible.
     fn create(dir: &Path, stem: &str) -> std::io::Result<Self> {
         for attempt in 1..=100u32 {
             let stem = if attempt == 1 {
@@ -55,24 +75,39 @@ impl RecordingSink {
             };
             let final_path = dir.join(format!("{stem}.webm"));
             let partial_path = dir.join(format!("{stem}.partial.webm"));
-            if final_path.exists() || partial_path.exists() {
+            if Self::destination_exists(&final_path, &partial_path)? {
                 continue;
             }
             let part_path = dir.join(format!("{stem}.webm.part"));
+            #[cfg(test)]
+            pause_after_name_check(&part_path);
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&part_path)
             {
                 Ok(file) => {
-                    return Ok(Self {
-                        file,
-                        part_path,
-                        final_path,
-                        partial_path,
-                        bytes: 0,
-                        torn: false,
-                    })
+                    match Self::destination_exists(&final_path, &partial_path) {
+                        Ok(false) => {
+                            return Ok(Self {
+                                file,
+                                part_path,
+                                final_path,
+                                partial_path,
+                                bytes: 0,
+                                torn: false,
+                            })
+                        }
+                        Ok(true) => {
+                            drop(file);
+                            fs::remove_file(&part_path)?;
+                        }
+                        Err(e) => {
+                            drop(file);
+                            let _ = fs::remove_file(&part_path);
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -82,6 +117,10 @@ impl RecordingSink {
             ErrorKind::AlreadyExists,
             "too many recordings with the same timestamp",
         ))
+    }
+
+    fn destination_exists(final_path: &Path, partial_path: &Path) -> std::io::Result<bool> {
+        Ok(final_path.try_exists()? || partial_path.try_exists()?)
     }
 
     /// Appends one chunk. A failed or short write is rolled back, so the bytes on disk
@@ -358,18 +397,17 @@ async fn start_recording(app: AppHandle) -> Result<String, String> {
         let dir = state.recordings_dir.lock().unwrap().clone();
         ensure_dir(&dir)?;
 
-        // Held across the create so two takes can never share a slot
-        let mut guard = state.take.lock().unwrap();
-        guard.begin()?;
+        state.take.lock().unwrap().begin()?;
         let stamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
         let sink = match RecordingSink::create(&dir, &format!("recording-{stamp}")) {
             Ok(sink) => sink,
             Err(e) => {
-                guard.cancel();
+                state.take.lock().unwrap().cancel();
                 return Err(format!("Cannot create recording file: {e}"));
             }
         };
         let path = sink.final_path.to_string_lossy().to_string();
+        let mut guard = state.take.lock().unwrap();
         if let Err(sink) = guard.register(sink) {
             // A close was requested while this start was in flight: salvage the
             // fresh file now so no orphan part is left behind
@@ -423,15 +461,8 @@ async fn finish_recording(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        // The lock spans the commit's rename, per RecordingSink::create's contract.
-        // It stops there rather than at the end of this closure: the remux below runs
-        // ffmpeg, and holding the take lock across an encode would stall every other
-        // command for its duration.
-        let (path, bytes) = {
-            let mut slot = state.take.lock().unwrap();
-            let sink = slot.finish()?;
-            sink.commit()?
-        };
+        let sink = state.take.lock().unwrap().finish()?;
+        let (path, bytes) = sink.commit()?;
         if bytes == 0 {
             return Err("Recording is empty (no data was captured)".into());
         }
@@ -453,10 +484,7 @@ async fn finish_recording(
 async fn abort_recording(app: AppHandle) -> Option<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        // The guard is held across the salvage's rename, per RecordingSink::create's
-        // contract.
-        let mut slot = state.take.lock().unwrap();
-        let decision = slot.abort();
+        let decision = state.take.lock().unwrap().abort();
         match decision {
             AbortDecision::Salvage(sink) => {
                 let (path, bytes) = sink.salvage();
@@ -595,10 +623,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AbortDecision, RecordingSink, TakeSlot};
+    use super::{
+        AbortDecision, CreateNameCheckHook, RecordingSink, TakeSlot, CREATE_NAME_CHECK_HOOK,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Barrier};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -725,6 +756,32 @@ mod tests {
         assert_eq!(second.part_path, dir.join("rec-2.webm.part"));
         // Windows refuses to delete files that are still open, so close both sinks first
         drop(first);
+        drop(second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_create_when_commit_frees_checked_part_name_picks_next_name() {
+        let dir = temp_dir("create-commit-race");
+        let mut first = RecordingSink::create(&dir, "rec").unwrap();
+        first.append(b"first take").unwrap();
+
+        let checked = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *CREATE_NAME_CHECK_HOOK.lock().unwrap() = Some(CreateNameCheckHook {
+            part_path: dir.join("rec.webm.part"),
+            checked: Arc::clone(&checked),
+            resume: Arc::clone(&resume),
+        });
+        let create_dir = dir.clone();
+        let create = std::thread::spawn(move || RecordingSink::create(&create_dir, "rec").unwrap());
+        checked.wait();
+
+        let first_path = first.commit().unwrap().0;
+        resume.wait();
+        let second = create.join().unwrap();
+
+        assert_ne!(second.final_path, first_path);
         drop(second);
         fs::remove_dir_all(&dir).unwrap();
     }
