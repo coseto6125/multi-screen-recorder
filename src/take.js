@@ -16,6 +16,12 @@
   // streaming fix removes.
   const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
+  // A stalled disk holds the backend's take lock for as long as the write
+  // blocks, and abort_recording needs that same lock. Waiting on it without a
+  // bound is what leaves the window unclosable, so give up and let the caller
+  // proceed: the bytes already on disk keep their .part name either way.
+  const ABORT_TIMEOUT_MS = 5000;
+
   function createTake({ invoke, onFail, maxQueuedBytes } = {}) {
     const limit = maxQueuedBytes || DEFAULT_MAX_QUEUED_BYTES;
     let chain = Promise.resolve();
@@ -94,12 +100,19 @@
       // Salvages whatever reached disk under a partial name, or null when
       // nothing usable exists. Resolves saved even when the command fails:
       // every exit path must release a close handler waiting on this take.
-      async abort() {
+      async abort(timeoutMs = ABORT_TIMEOUT_MS) {
+        let timer;
         try {
-          return await invoke('abort_recording');
+          return await Promise.race([
+            invoke('abort_recording'),
+            new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+          ]);
         } catch (err) {
           return null;
         } finally {
+          // Race leaves the loser running; an uncleared timer keeps the take
+          // object alive for the full timeout after the abort already returned.
+          clearTimeout(timer);
           resolveSaved();
         }
       },

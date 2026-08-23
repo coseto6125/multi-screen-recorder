@@ -86,7 +86,7 @@ let phase = 'idle'; // idle | starting | recording | finalizing
         await withTimeout(current.drain().catch(() => {}), 10000);
         await current.abort();
       } else {
-        await invoke('abort_recording').catch(() => null);
+        await withTimeout(invoke('abort_recording').catch(() => null), 5000);
       }
     } finally {
       await appWindow.destroy();
@@ -381,6 +381,10 @@ let phase = 'idle'; // idle | starting | recording | finalizing
 
     mediaRecorder.onstop = async () => {
       clearAutoStop();
+      // Read before stopDurationTimer clears startTime. MediaRecorder writes a
+      // live WebM with no Duration header, so ffmpeg has nothing to measure the
+      // convert against and the progress bar would sit at 0% for the whole encode.
+      const elapsedSec = startTime ? (Date.now() - startTime) / 1000 : null;
       stopDurationTimer();
       setStatus('Finalizing…', 'busy');
 
@@ -414,7 +418,10 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       try {
         setStatus('Converting to MP4…', 'busy');
         showConvertProgress(baseName(savedPath));
-        const mp4Path = await invoke('convert_to_mp4', { webmPath: savedPath });
+        const mp4Path = await invoke('convert_to_mp4', {
+          webmPath: savedPath,
+          knownDurationSec: elapsedSec,
+        });
         lastSavedPath = mp4Path;
         setStatus('Saved: ' + baseName(mp4Path));
       } catch (err) {

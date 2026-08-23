@@ -64,6 +64,10 @@ struct FfmpegJob<'a> {
     output: &'a Path,
     args: &'a [&'a str],
     stage: Option<&'a str>,
+    /// Total seconds to measure progress against when the input carries no
+    /// `Duration:` header. MediaRecorder writes a live WebM with an unknown-size
+    /// Segment, so without this the percentage never leaves 0.
+    fallback_duration: Option<f64>,
 }
 
 fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
@@ -128,17 +132,15 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
                 duration = Some(captures_to_secs(&caps));
             }
         }
-        if job.stage.is_some() {
-            if let Some(d) = duration {
-                if d > 0.0 {
-                    if let Some(caps) = TIME_RE.captures_iter(&acc).last() {
-                        let current = captures_to_secs(&caps);
-                        let pct = ((current / d) * 100.0).round().min(99.0) as i64;
-                        if pct != last_pct {
-                            last_pct = pct;
-                            emit(pct as u32);
-                        }
-                    }
+        // A real header always wins; the caller's estimate only fills the gap
+        let total = duration.or(job.fallback_duration).filter(|d| *d > 0.0);
+        if let (Some(_), Some(d)) = (job.stage, total) {
+            if let Some(caps) = TIME_RE.captures_iter(&acc).last() {
+                let current = captures_to_secs(&caps);
+                let pct = ((current / d) * 100.0).round().min(99.0) as i64;
+                if pct != last_pct {
+                    last_pct = pct;
+                    emit(pct as u32);
                 }
             }
         }
@@ -178,6 +180,7 @@ pub fn convert_to_mp4(
     input: &Path,
     output: &Path,
     emit_progress: bool,
+    fallback_duration: Option<f64>,
 ) -> Result<(), String> {
     let stage = if emit_progress { Some("convert") } else { None };
     let job = FfmpegJob {
@@ -201,6 +204,7 @@ pub fn convert_to_mp4(
             "-b:a", "128k",
         ],
         stage,
+        fallback_duration,
     };
     run_ffmpeg(app, &job)
 }
@@ -218,6 +222,7 @@ pub fn fix_webm_metadata(app: &AppHandle, webm_path: &Path) -> Result<(), String
         output: &fixed,
         args: &["-c", "copy"],
         stage: Some("finalize"),
+        fallback_duration: None,
     };
     if let Err(e) = run_ffmpeg(app, &job) {
         let _ = std::fs::remove_file(&fixed); // don't leave a half-written copy behind

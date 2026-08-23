@@ -343,31 +343,38 @@ async fn change_recordings_path(app: AppHandle) -> Result<PickResult, String> {
 }
 
 // Open the output file before recording starts, so a disk error surfaces immediately
-// instead of after the user has already recorded for an hour.
+// instead of after the user has already recorded for an hour. The open runs on the
+// blocking pool: RecordingSink::create tries up to 100 names, so on a slow or contended
+// directory it must not sit on a tokio worker that other IPC calls share.
 #[tauri::command(async)]
-fn start_recording(state: State<'_, AppState>) -> Result<String, String> {
-    let dir = state.recordings_dir.lock().unwrap().clone();
-    ensure_dir(&dir)?;
+async fn start_recording(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let dir = state.recordings_dir.lock().unwrap().clone();
+        ensure_dir(&dir)?;
 
-    // Held across the create so two takes can never share a slot
-    let mut guard = state.take.lock().unwrap();
-    guard.begin()?;
-    let stamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
-    let sink = match RecordingSink::create(&dir, &format!("recording-{stamp}")) {
-        Ok(sink) => sink,
-        Err(e) => {
-            guard.cancel();
-            return Err(format!("Cannot create recording file: {e}"));
+        // Held across the create so two takes can never share a slot
+        let mut guard = state.take.lock().unwrap();
+        guard.begin()?;
+        let stamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
+        let sink = match RecordingSink::create(&dir, &format!("recording-{stamp}")) {
+            Ok(sink) => sink,
+            Err(e) => {
+                guard.cancel();
+                return Err(format!("Cannot create recording file: {e}"));
+            }
+        };
+        let path = sink.final_path.to_string_lossy().to_string();
+        if let Err(sink) = guard.register(sink) {
+            // A close was requested while this start was in flight: salvage the
+            // fresh file now so no orphan part is left behind
+            sink.salvage();
+            return Err("Recording was closed before it could start".into());
         }
-    };
-    let path = sink.final_path.to_string_lossy().to_string();
-    if let Err(sink) = guard.register(sink) {
-        // A close was requested while this start was in flight: salvage the
-        // fresh file now so no orphan part is left behind
-        sink.salvage();
-        return Err("Recording was closed before it could start".into());
-    }
-    Ok(path)
+        Ok(path)
+    })
+    .await
+    .map_err(|e| format!("Cannot create recording file: {e}"))?
 }
 
 // Append one MediaRecorder chunk (raw IPC body) to the open file. The IPC buffer is
@@ -428,21 +435,36 @@ async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String>
 
 // Close the file after a failed or interrupted take. The bytes already written stay on
 // disk under a `.partial.webm` name, so a failure costs the tail, not the whole session.
+// Runs on the blocking pool like the other two file commands: salvage() flushes with
+// sync_all and renames, and the window close handler waits on this call.
 #[tauri::command(async)]
-fn abort_recording(state: State<'_, AppState>) -> Option<String> {
-    match state.take.lock().unwrap().abort() {
-        AbortDecision::Salvage(sink) => {
-            let (path, bytes) = sink.salvage();
-            (bytes > 0).then(|| path.to_string_lossy().to_string())
+async fn abort_recording(app: AppHandle) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        // Bind the decision to a local so the lock is released before the
+        // salvage: sync_all and rename must not run under the take lock, or a
+        // close-time abort blocks every other command for the whole flush.
+        let decision = state.take.lock().unwrap().abort();
+        match decision {
+            AbortDecision::Salvage(sink) => {
+                let (path, bytes) = sink.salvage();
+                (bytes > 0).then(|| path.to_string_lossy().to_string())
+            }
+            // A start still in flight salvages its own fresh file on register()
+            _ => None,
         }
-        // A start still in flight salvages its own fresh file on register()
-        _ => None,
-    }
+    })
+    .await
+    .unwrap_or(None)
 }
 
 // Convert WebM to MP4; emits convert-progress {fileName, percent}; deletes source on success
 #[tauri::command]
-async fn convert_to_mp4(app: AppHandle, webm_path: String) -> Result<String, String> {
+async fn convert_to_mp4(
+    app: AppHandle,
+    webm_path: String,
+    known_duration_sec: Option<f64>,
+) -> Result<String, String> {
     let input = PathBuf::from(&webm_path);
     if !input.exists() {
         return Err("WebM file not found".into());
@@ -451,7 +473,9 @@ async fn convert_to_mp4(app: AppHandle, webm_path: String) -> Result<String, Str
     let app2 = app.clone();
     let in2 = input.clone();
     let out2 = output.clone();
-    tauri::async_runtime::spawn_blocking(move || encoder::convert_to_mp4(&app2, &in2, &out2, true))
+    tauri::async_runtime::spawn_blocking(move || {
+            encoder::convert_to_mp4(&app2, &in2, &out2, true, known_duration_sec)
+        })
         .await
         .map_err(|e| e.to_string())??;
     let _ = fs::remove_file(&input);
@@ -505,7 +529,10 @@ async fn convert_file_to_mp4(app: AppHandle) -> Result<ConvertFileResult, String
     let in2 = input.clone();
     let out2 = output.clone();
     let result =
-        tauri::async_runtime::spawn_blocking(move || encoder::convert_to_mp4(&app2, &in2, &out2, true))
+        tauri::async_runtime::spawn_blocking(move || {
+            // A file the user picked carries its own Duration header
+            encoder::convert_to_mp4(&app2, &in2, &out2, true, None)
+        })
             .await
             .map_err(|e| e.to_string())?;
 
