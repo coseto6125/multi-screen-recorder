@@ -45,6 +45,20 @@ fn ffmpeg_path(app: &AppHandle) -> PathBuf {
     PathBuf::from("ffmpeg")
 }
 
+/// The percentage to report from ffmpeg's stderr so far, or None when the buffer
+/// carries no status line yet. Capped at 99: only a successful exit reports 100.
+fn progress_percent(acc: &str, total: f64) -> Option<i64> {
+    let caps = TIME_RE.captures_iter(acc).last()?;
+    let current = captures_to_secs(&caps);
+    Some(((current / total) * 100.0).round().min(99.0) as i64)
+}
+
+/// The seconds a `Duration:` or `time=` capture stands for, or None when the buffer
+/// has not carried a duration header yet.
+fn header_duration(acc: &str) -> Option<f64> {
+    DURATION_RE.captures(acc).map(|caps| captures_to_secs(&caps))
+}
+
 fn captures_to_secs(caps: &regex::Captures) -> f64 {
     let h: f64 = caps[1].parse().unwrap_or(0.0);
     let m: f64 = caps[2].parse().unwrap_or(0.0);
@@ -128,16 +142,12 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
         }
         acc.push_str(&String::from_utf8_lossy(&buf[..n]));
         if duration.is_none() {
-            if let Some(caps) = DURATION_RE.captures(&acc) {
-                duration = Some(captures_to_secs(&caps));
-            }
+            duration = header_duration(&acc);
         }
         // A real header always wins; the caller's estimate only fills the gap
         let total = duration.or(job.fallback_duration).filter(|d| *d > 0.0);
         if let (Some(_), Some(d)) = (job.stage, total) {
-            if let Some(caps) = TIME_RE.captures_iter(&acc).last() {
-                let current = captures_to_secs(&caps);
-                let pct = ((current / d) * 100.0).round().min(99.0) as i64;
+            if let Some(pct) = progress_percent(&acc, d) {
                 if pct != last_pct {
                     last_pct = pct;
                     emit(pct as u32);
@@ -242,4 +252,54 @@ pub fn fix_webm_metadata(
         e.to_string()
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{header_duration, progress_percent};
+
+    #[test]
+    fn test_progress_percent_reads_the_newest_status_line() {
+        // ffmpeg rewrites its status line, so acc holds every one printed so far.
+        let acc = "frame=1 time=00:00:10.00 bitrate=1\rframe=2 time=00:00:30.00 bitrate=1\r";
+        assert_eq!(progress_percent(acc, 60.0), Some(50));
+    }
+
+    #[test]
+    fn test_progress_percent_without_a_status_line_is_none() {
+        assert_eq!(progress_percent("Input #0, matroska,webm\n", 60.0), None);
+    }
+
+    #[test]
+    fn test_progress_percent_caps_at_99_when_the_estimate_runs_short() {
+        // The caller's elapsed-seconds estimate can undershoot the real stream, so
+        // time= passes total. 100 belongs to a successful exit, not to a guess.
+        assert_eq!(progress_percent("time=00:01:30.00\r", 60.0), Some(99));
+    }
+
+    #[test]
+    fn test_progress_percent_parses_fractional_seconds_by_digit_count() {
+        // ffmpeg prints centiseconds; the parser divides by 10^digits, so a two-digit
+        // fraction must read as .50 rather than 50.
+        assert_eq!(progress_percent("time=00:00:00.50\r", 1.0), Some(50));
+    }
+
+    #[test]
+    fn test_progress_percent_counts_hours_and_minutes() {
+        assert_eq!(progress_percent("time=01:30:00.00\r", 10800.0), Some(50));
+    }
+
+    #[test]
+    fn test_header_duration_reads_the_input_header() {
+        let acc = "  Duration: 00:01:40.00, start: 0.000000, bitrate: 385 kb/s\n";
+        assert_eq!(header_duration(acc), Some(100.0));
+    }
+
+    #[test]
+    fn test_header_duration_absent_for_a_live_webm() {
+        // MediaRecorder writes an unknown-size Segment: this is the case the
+        // caller-supplied fallback exists for.
+        let acc = "  Duration: N/A, start: -0.007000, bitrate: N/A\n";
+        assert_eq!(header_duration(acc), None);
+    }
 }
