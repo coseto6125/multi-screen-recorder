@@ -40,10 +40,12 @@ struct RecordingSink {
 impl RecordingSink {
     /// Creates `<stem>.webm.part`, never overwriting an existing recording.
     ///
-    /// Only the `.part` name is reserved atomically, by `create_new`. The final and
-    /// partial names are picked with a plain `exists()` check, so a caller that
-    /// renames onto either of them must hold the take lock across the rename, or it
-    /// can free a name between another take's check and its `create_new`.
+    /// **Call this under the take lock, and rename a `.part` file away under the same
+    /// lock.** Only the `.part` name is reserved atomically, by `create_new`. The
+    /// final and partial names are picked with a plain `exists()` check, so those
+    /// checks and the `create_new` below are one check-then-act. A rename that frees
+    /// a `.part` name inside another take's window lets that take claim it, and its
+    /// final name is then the earlier recording.
     fn create(dir: &Path, stem: &str) -> std::io::Result<Self> {
         for attempt in 1..=100u32 {
             let stem = if attempt == 1 {
@@ -421,11 +423,10 @@ async fn finish_recording(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        // The lock spans the commit for the reason RecordingSink::create documents:
-        // the rename frees the `.part` name, and another take choosing names must not
-        // be between its exists() check and its create_new when that happens. It stops
-        // at the commit, not at the end of this closure -- the remux below runs ffmpeg,
-        // and holding the take lock across that would stall every other command.
+        // The lock spans the commit's rename, per RecordingSink::create's contract.
+        // It stops there rather than at the end of this closure: the remux below runs
+        // ffmpeg, and holding the take lock across an encode would stall every other
+        // command for its duration.
         let (path, bytes) = {
             let mut slot = state.take.lock().unwrap();
             let sink = slot.finish()?;
@@ -452,10 +453,8 @@ async fn finish_recording(
 async fn abort_recording(app: AppHandle) -> Option<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        // The guard is held across the salvage on purpose. RecordingSink::create
-        // picks its final and partial names with a plain exists() check, so a
-        // rename that can claim one of them must not run while another take is
-        // choosing. Only the .part name is reserved atomically.
+        // The guard is held across the salvage's rename, per RecordingSink::create's
+        // contract.
         let mut slot = state.take.lock().unwrap();
         let decision = slot.abort();
         match decision {

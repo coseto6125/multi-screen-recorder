@@ -149,7 +149,7 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
         // long encode. Trim once a total is known, from the header or the caller's
         // estimate. The cut lands on a char boundary rather than a line break, which
         // is safe: the scans above run first and take the newest match, and the
-        // retained tail is over 4 KiB, hundreds of times the length of one match.
+        // retained tail is about 4 KiB, hundreds of times the length of one match.
         let cap = if total.is_some() { 8192 } else { 262_144 };
         if acc.len() > cap {
             let target = acc.len() - cap / 2;
