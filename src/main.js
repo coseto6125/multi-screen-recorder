@@ -54,6 +54,10 @@
   let selectedBitrate = 3000000;
   let maxRes = { w: 1920, h: 1080 };
   // The webview owns take phase transitions; the backend owns the open file.
+  // Only the close path bounds its abort: an unbounded wait there is what leaves
+  // the window unclosable when the disk stalls. Every other abort caller waits,
+  // because waiting is what gets it the salvaged path.
+  const CLOSE_ABORT_TIMEOUT_MS = 5000;
 let phase = 'idle'; // idle | starting | recording | finalizing
   let mediaRecorder = null;
   let recordStream = null;
@@ -84,9 +88,9 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       } else if (current) {
         current.markClosing(); // stop queueing chunks the file will never receive
         await withTimeout(current.drain().catch(() => {}), 10000);
-        await current.abort();
+        await current.abort(CLOSE_ABORT_TIMEOUT_MS);
       } else {
-        await withTimeout(invoke('abort_recording').catch(() => null), 5000);
+        await withTimeout(invoke('abort_recording').catch(() => null), CLOSE_ABORT_TIMEOUT_MS);
       }
     } finally {
       await appWindow.destroy();
@@ -395,7 +399,7 @@ let phase = 'idle'; // idle | starting | recording | finalizing
       try {
         await current.drain(); // drain the appends still in flight; rejects on a latched write error
         // A conversion rewrites the timestamps anyway, so only a kept WebM needs the fix
-        savedPath = await current.commit(!doConvert);
+        savedPath = await current.commit(!doConvert, elapsedSec);
       } catch (err) {
         // Whatever reached disk before the failure is kept under a .partial.webm name
         const partial = await current.abort();

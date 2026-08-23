@@ -121,3 +121,13 @@ test('test_abort_gives_up_when_the_backend_never_answers', async () => {
   assert.equal(await take.abort(20), null);
   await take.saved;
 });
+
+test('test_abort_without_a_timeout_waits_for_the_salvaged_path', async () => {
+  // Every caller but the close handler wants the path, not a fast null: a slow
+  // sync_all still ends with the bytes renamed, and the user is told where.
+  const take = createTake({
+    invoke: () => new Promise((resolve) => setTimeout(() => resolve('/r/a.partial.webm'), 30)),
+  });
+  assert.equal(await take.abort(), '/r/a.partial.webm');
+  await take.saved;
+});

@@ -346,7 +346,7 @@ async fn change_recordings_path(app: AppHandle) -> Result<PickResult, String> {
 // instead of after the user has already recorded for an hour. The open runs on the
 // blocking pool: RecordingSink::create tries up to 100 names, so on a slow or contended
 // directory it must not sit on a tokio worker that other IPC calls share.
-#[tauri::command(async)]
+#[tauri::command]
 async fn start_recording(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
@@ -411,7 +411,11 @@ async fn append_recording_chunk(
 // Close the file and return the final path. `remux` runs the metadata fix; skip it when
 // the caller converts to MP4 next, because that pass rewrites the timestamps anyway.
 #[tauri::command]
-async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String> {
+async fn finish_recording(
+    app: AppHandle,
+    remux: bool,
+    known_duration_sec: Option<f64>,
+) -> Result<String, String> {
     let sink = {
         let state: State<'_, AppState> = app.state();
         let mut slot = state.take.lock().unwrap();
@@ -425,7 +429,7 @@ async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String>
         }
         if remux {
             // Regenerate PTS for stable duration and seeking; keep the file on failure
-            let _ = encoder::fix_webm_metadata(&app, &path);
+            let _ = encoder::fix_webm_metadata(&app, &path, known_duration_sec);
         }
         Ok(path.to_string_lossy().to_string())
     })
@@ -437,14 +441,16 @@ async fn finish_recording(app: AppHandle, remux: bool) -> Result<String, String>
 // disk under a `.partial.webm` name, so a failure costs the tail, not the whole session.
 // Runs on the blocking pool like the other two file commands: salvage() flushes with
 // sync_all and renames, and the window close handler waits on this call.
-#[tauri::command(async)]
+#[tauri::command]
 async fn abort_recording(app: AppHandle) -> Option<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        // Bind the decision to a local so the lock is released before the
-        // salvage: sync_all and rename must not run under the take lock, or a
-        // close-time abort blocks every other command for the whole flush.
-        let decision = state.take.lock().unwrap().abort();
+        // The guard is held across the salvage on purpose. RecordingSink::create
+        // picks its final and partial names with a plain exists() check, so a
+        // rename that can claim one of them must not run while another take is
+        // choosing. Only the .part name is reserved atomically.
+        let mut slot = state.take.lock().unwrap();
+        let decision = slot.abort();
         match decision {
             AbortDecision::Salvage(sink) => {
                 let (path, bytes) = sink.salvage();
@@ -530,7 +536,9 @@ async fn convert_file_to_mp4(app: AppHandle) -> Result<ConvertFileResult, String
     let out2 = output.clone();
     let result =
         tauri::async_runtime::spawn_blocking(move || {
-            // A file the user picked carries its own Duration header
+            // No estimate to give: a picked file may be one of this app's own
+            // .partial.webm salvages, which carries no Duration header either,
+            // and nothing here knows how long it ran.
             encoder::convert_to_mp4(&app2, &in2, &out2, true, None)
         })
             .await
