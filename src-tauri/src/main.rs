@@ -65,7 +65,15 @@ struct RecordingSink {
 impl RecordingSink {
     /// Creates `<stem>.webm.part`, never overwriting an existing recording. After the
     /// atomic create reserves the part name, the other two names are checked again: a
-    /// rename that freed the part inside the first check's window must already be visible.
+    /// rename that freed the part inside the first check's window must already be
+    /// visible.
+    ///
+    /// The recheck sees a freed name only when freeing it produced a destination. The
+    /// other way a part name comes free is the zero-byte branch of `commit`/`salvage`,
+    /// which removes the file and produces nothing, so two takes can end up holding
+    /// the same stem. That is safe only because a zero-byte take writes no file at
+    /// all, which `test_commit_with_no_bytes_leaves_no_file` and its salvage twin
+    /// pin down. Give the zero-byte branch an output and this stops holding.
     fn create(dir: &Path, stem: &str) -> std::io::Result<Self> {
         for attempt in 1..=100u32 {
             let stem = if attempt == 1 {
@@ -99,8 +107,12 @@ impl RecordingSink {
                             })
                         }
                         Ok(true) => {
+                            // Best effort, like the Err arm below: this is our own
+                            // scratch file, and the next attempt uses a different
+                            // stem either way. A remove that fails must not turn a
+                            // name collision into "cannot start recording".
                             drop(file);
-                            fs::remove_file(&part_path)?;
+                            let _ = fs::remove_file(&part_path);
                         }
                         Err(e) => {
                             drop(file);
@@ -205,6 +217,10 @@ impl RecordingSink {
 /// this slot owns whether a backend file is open, and what a close request means
 /// while a start is still in flight. Every pairing rule between commands lives
 /// here so the commands stay thin adapters over it.
+///
+/// It does not own filename uniqueness. Two takes never share a name because
+/// `RecordingSink::create` rechecks its destinations after the atomic create, so a
+/// command may rename or salvage outside this lock.
 struct TakeSlot {
     sink: Option<RecordingSink>,
     /// True between the start of start_recording and register(): no file is
@@ -272,8 +288,19 @@ impl TakeSlot {
         self.sink.as_mut().ok_or_else(|| "No recording is in progress".to_string())
     }
 
+    /// Takes the open sink. A finish arriving while a start is still in flight
+    /// leaves the slot closing, so `register()` salvages the fresh file instead of
+    /// storing a sink nobody will ever finish -- the same handling `abort()` gives
+    /// that window.
     fn finish(&mut self) -> Result<RecordingSink, String> {
-        self.sink.take().ok_or_else(|| "No recording is in progress".to_string())
+        if let Some(sink) = self.sink.take() {
+            return Ok(sink);
+        }
+        if self.starting {
+            self.close_pending = true;
+            return Err("The recording is still starting".into());
+        }
+        Err("No recording is in progress".to_string())
     }
 }
 
@@ -409,8 +436,10 @@ async fn start_recording(app: AppHandle) -> Result<String, String> {
         let path = sink.final_path.to_string_lossy().to_string();
         let mut guard = state.take.lock().unwrap();
         if let Err(sink) = guard.register(sink) {
-            // A close was requested while this start was in flight: salvage the
-            // fresh file now so no orphan part is left behind
+            // A close was requested while this start was in flight. abort_recording
+            // returned PendingStart without waiting for us, so this salvage is best
+            // effort: a close that destroys the window first leaves the zero-byte
+            // part behind, and the next create's create_new skips past it.
             sink.salvage();
             return Err("Recording was closed before it could start".into());
         }
@@ -783,6 +812,49 @@ mod tests {
 
         assert_ne!(second.final_path, first_path);
         drop(second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_commit_with_no_bytes_leaves_no_file() {
+        // create's recheck cannot see a part name freed by a remove, so two takes can
+        // hold the same stem. Safe only while a zero-byte take produces nothing.
+        let dir = temp_dir("zero-commit-no-file");
+        let sink = RecordingSink::create(&dir, "rec").unwrap();
+        let (final_path, bytes) = sink.commit().unwrap();
+        assert_eq!(bytes, 0);
+        assert!(!final_path.exists(), "a zero-byte commit must write no file");
+        assert!(!dir.join("rec.webm.part").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_salvage_with_no_bytes_leaves_no_file() {
+        let dir = temp_dir("zero-salvage-no-file");
+        let sink = RecordingSink::create(&dir, "rec").unwrap();
+        let (path, bytes) = sink.salvage();
+        assert_eq!(bytes, 0);
+        assert!(!path.exists(), "a zero-byte salvage must write no file");
+        assert!(!dir.join("rec.partial.webm").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_finish_while_starting_leaves_the_slot_closing() {
+        // begin() and register() no longer share one lock hold, so a finish can land
+        // between them. It must set the slot closing the way abort() does, or
+        // register() stores a sink nobody will ever finish and every later start is
+        // refused for the life of the process.
+        let mut slot = TakeSlot::new();
+        slot.begin().unwrap();
+        assert!(slot.finish().is_err());
+
+        let dir = temp_dir("finish-while-starting");
+        let sink = RecordingSink::create(&dir, "rec").unwrap();
+        let returned = slot.register(sink);
+        assert!(returned.is_err(), "register must hand the sink back to be salvaged");
+        returned.unwrap_err().salvage();
+        slot.begin().expect("the slot must accept a new take");
         fs::remove_dir_all(&dir).unwrap();
     }
 
