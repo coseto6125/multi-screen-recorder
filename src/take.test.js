@@ -112,3 +112,12 @@ test('test_start_twice_rejects', async () => {
   await take.start();
   await assert.rejects(() => take.start(), /already started/);
 });
+
+test('test_abort_gives_up_when_the_backend_never_answers', async () => {
+  // A stalled disk holds the take lock, so abort_recording never returns. The
+  // close handler awaits this call before destroying the window, so an
+  // unbounded wait is what leaves the window unclosable.
+  const take = createTake({ invoke: () => new Promise(() => {}) });
+  assert.equal(await take.abort(20), null);
+  await take.saved;
+});
