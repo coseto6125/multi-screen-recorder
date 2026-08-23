@@ -147,7 +147,7 @@ fn run_ffmpeg(app: &AppHandle, job: &FfmpegJob) -> Result<(), String> {
         // Keep a bounded tail. FFmpeg prints a progress line per frame, so holding the
         // whole log and rescanning it on every read is quadratic over a long recording.
         // Trim only once the duration header has been read, and never below a full line.
-        let cap = if duration.is_some() { 8192 } else { 262_144 };
+        let cap = if total.is_some() { 8192 } else { 262_144 };
         if acc.len() > cap {
             let target = acc.len() - cap / 2;
             let cut = (target..acc.len())
@@ -211,7 +211,11 @@ pub fn convert_to_mp4(
 
 /// Fast metadata fix for WebM: regenerate PTS for stable duration and seeking.
 /// No re-encode: -fflags +genpts -c copy. Replaces the file in place.
-pub fn fix_webm_metadata(app: &AppHandle, webm_path: &Path) -> Result<(), String> {
+pub fn fix_webm_metadata(
+    app: &AppHandle,
+    webm_path: &Path,
+    fallback_duration: Option<f64>,
+) -> Result<(), String> {
     if !webm_path.exists() {
         return Err("WebM file not found".into());
     }
@@ -222,7 +226,7 @@ pub fn fix_webm_metadata(app: &AppHandle, webm_path: &Path) -> Result<(), String
         output: &fixed,
         args: &["-c", "copy"],
         stage: Some("finalize"),
-        fallback_duration: None,
+        fallback_duration,
     };
     if let Err(e) = run_ffmpeg(app, &job) {
         let _ = std::fs::remove_file(&fixed); // don't leave a half-written copy behind

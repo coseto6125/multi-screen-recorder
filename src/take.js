@@ -16,12 +16,6 @@
   // streaming fix removes.
   const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
-  // A stalled disk holds the backend's take lock for as long as the write
-  // blocks, and abort_recording needs that same lock. Waiting on it without a
-  // bound is what leaves the window unclosable, so give up and let the caller
-  // proceed: the bytes already on disk keep their .part name either way.
-  const ABORT_TIMEOUT_MS = 5000;
-
   function createTake({ invoke, onFail, maxQueuedBytes } = {}) {
     const limit = maxQueuedBytes || DEFAULT_MAX_QUEUED_BYTES;
     let chain = Promise.resolve();
@@ -91,8 +85,8 @@
       },
 
       // Closes and names the file. Resolves saved on success.
-      async commit(remux) {
-        const savedPath = await invoke('finish_recording', { remux });
+      async commit(remux, knownDurationSec) {
+        const savedPath = await invoke('finish_recording', { remux, knownDurationSec });
         resolveSaved();
         return savedPath;
       },
@@ -100,18 +94,25 @@
       // Salvages whatever reached disk under a partial name, or null when
       // nothing usable exists. Resolves saved even when the command fails:
       // every exit path must release a close handler waiting on this take.
-      async abort(timeoutMs = ABORT_TIMEOUT_MS) {
+      // timeoutMs gives up on a backend that never answers and reports null.
+      // Only the window-close path wants it: everywhere else the window stays
+      // responsive, and waiting is what gets the caller the salvaged path
+      // instead of a message that says nothing was kept.
+      async abort(timeoutMs) {
         let timer;
         try {
+          const call = invoke('abort_recording');
+          if (!timeoutMs) return await call;
           return await Promise.race([
-            invoke('abort_recording'),
+            call,
             new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
           ]);
         } catch (err) {
           return null;
         } finally {
-          // Race leaves the loser running; an uncleared timer keeps the take
-          // object alive for the full timeout after the abort already returned.
+          // Race leaves the loser's timer running, and an uncleared one holds
+          // the event loop open for the rest of the timeout. clearTimeout takes
+          // undefined as a no-op, so the unbounded path needs no branch here.
           clearTimeout(timer);
           resolveSaved();
         }
