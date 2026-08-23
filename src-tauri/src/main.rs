@@ -38,9 +38,12 @@ struct RecordingSink {
 }
 
 impl RecordingSink {
-    /// Creates `<stem>.webm.part`, never overwriting an existing recording. All three
-    /// names this take can end up under are claimed together, so an aborted take can
-    /// never land on the partial file of an earlier one with the same timestamp.
+    /// Creates `<stem>.webm.part`, never overwriting an existing recording.
+    ///
+    /// Only the `.part` name is reserved atomically, by `create_new`. The final and
+    /// partial names are picked with a plain `exists()` check, so a caller that
+    /// renames onto either of them must hold the take lock across the rename, or it
+    /// can free a name between another take's check and its `create_new`.
     fn create(dir: &Path, stem: &str) -> std::io::Result<Self> {
         for attempt in 1..=100u32 {
             let stem = if attempt == 1 {
@@ -416,14 +419,18 @@ async fn finish_recording(
     remux: bool,
     known_duration_sec: Option<f64>,
 ) -> Result<String, String> {
-    let sink = {
-        let state: State<'_, AppState> = app.state();
-        let mut slot = state.take.lock().unwrap();
-        slot.finish()?
-    };
-
     tauri::async_runtime::spawn_blocking(move || {
-        let (path, bytes) = sink.commit()?;
+        let state: State<'_, AppState> = app.state();
+        // The lock spans the commit for the reason RecordingSink::create documents:
+        // the rename frees the `.part` name, and another take choosing names must not
+        // be between its exists() check and its create_new when that happens. It stops
+        // at the commit, not at the end of this closure -- the remux below runs ffmpeg,
+        // and holding the take lock across that would stall every other command.
+        let (path, bytes) = {
+            let mut slot = state.take.lock().unwrap();
+            let sink = slot.finish()?;
+            sink.commit()?
+        };
         if bytes == 0 {
             return Err("Recording is empty (no data was captured)".into());
         }
